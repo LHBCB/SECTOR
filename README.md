@@ -30,6 +30,9 @@ This installs:
 
 ## 2. Running SECTOR from the command line
 SECTOR expects data in `.h5ad` format (AnnData). By default, both the CLI and Python API look for files in `{dataset_path}/{dataset}/{slice}.h5ad`, for example, the 10x Visium DLPFC slice used in the tutorial `./data/DLPFC/151673.h5ad`. You can change `--dataset_path`, `--dataset` and `--slice` (or the corresponding arguments in the Python API) to point to your own datasets.
+
+Data can be downloaded from http://sdmbench.drai.cn/tcm/download/?file_path=/mnt/JINGD/data/file/sdmbench/db/151673.h5ad.
+
 The main CLI entry point is run_sector.py. A typical run on a DLPFC slice is:
 ```bash
 python  run_sector.py \
