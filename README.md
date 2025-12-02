@@ -1,8 +1,18 @@
-# SECTOR
+# SECTOR: Structural Entropy-based Learning of Spatiotemporal Organisation in Spatial Transcriptomics
+
+<p align="center">
+    <img width="100%" src="SECTOR_workflow.jpg" alt="SECTOR model">
+</p>
+
+SECTOR (Structural Entropy-based Clustering and pseudoTime ORdering) is a lightweight deep graph learning framework for spatial transcriptomics that jointly learns spatial domains and a continuous pseudotime from a same model. It builds a fused spatial–expression graph from spot/cell coordinates and gene expression, then optimises a differentiable structural entropy objective regularised by a spatial total variation term to obtain spatially coherent domains and smooth pseudotime. 
+
+SECTOR has been benchmarked across five major ST technologies (10x Visium, MERFISH, STARmap, BaristaSeq and Stereo-seq), where it matches or outperforms state-of-the-art spatial clustering methods and improves upon existing spatiotemporal approaches, while remaining computationally efficient. 
+
+The repository provides both a command-line interface and a Python API for applying SECTOR to `.h5ad` (AnnData) datasets, as described in our manuscript.
 
 ---
 
-## 1. Clone the repo
+## 1. Clone the repository
 ```bash
 git clone https://github.com/LHBCB/SECTOR.git
 cd SECTOR
@@ -59,8 +69,10 @@ python  run_sector.py \
     --island_min_abs 40
 ```
 
-## 4. Running SECTOR from the Python API
+## 4. Using SECTOR via the Python API
 SECTOR can also be used directly from Python, for example in Jupyter notebooks. See the tutorial notebook [tutorial_DLPFC.ipynb](tutorial_DLPFC.ipynb), which demonstrates:
 - How to initialise and train a SECTOR model using the Python API.
 - How to infer and visualise the spatial domains and pseudotime.
-- How to inspect evaluation metrics (when input data contain labels).
+- How to inspect evaluation metrics (when the input data contain labels).
+
+You can extend this workflow to your own datasets by adapting the dataset path, dataset name, slice ID, and hyperparameters.
