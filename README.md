@@ -35,17 +35,15 @@ This installs, among others:
 - Notebook support: `notebook`, `ipykernel`
 
 ## 3. Running SECTOR from the command line
-SECTOR expects data in `.h5ad` (AnnData) format. By default, both the CLI and Python API look for files at 
+SECTOR expects data in `.h5ad` (AnnData) format. By default, both the CLI and Python API look for files at:
 ```bash
 {dataset_path}/{dataset}/{slice}.h5ad
 ```
-For example, the 10x Visium DLPFC slice used in the tutorial is expected at
+For example, the 10x Visium DLPFC slice used in the tutorial (see our paper for detailed information about this dataset) is expected at:
 ```bash
 ./data/DLPFC/151673.h5ad
 ```
 You can change `--dataset_path`, `--dataset` and `--slice` (or the corresponding arguments in the Python API) to point to your own datasets.
-
-Example dataset used in the tutorial can be downloaded from: http://sdmbench.drai.cn/tcm/download/?file_path=/mnt/JINGD/data/file/sdmbench/db/151673.h5ad.
 
 The main CLI entry point is `run_sector.py`. A typical run on a DLPFC slice is:
 ```bash
@@ -60,8 +58,9 @@ python  run_sector.py \
     --island_min_frac 0.1 \
     --island_min_abs 40
 ```
-## 4. Running SECTOR from Python API
-SECTOR can also be used directly from Python, for example in Jupyter notebooks. See the tutorial notebook `tutorial_DLPFC.ipynb`, which demonstrates:
+
+## 4. Running SECTOR from the Python API
+SECTOR can also be used directly from Python, for example in Jupyter notebooks. See the tutorial notebook [tutorial_DLPFC.ipynb](tutorial_DLPFC.ipynb), which demonstrates:
 - How to initialise and train a SECTOR model using the Python API.
-- Howo to infer and visualise the spatial domains and pseudotime.
-- How to inspect evaluation metrics (when input data contains labels).
+- How to infer and visualise the spatial domains and pseudotime.
+- How to inspect evaluation metrics (when input data contain labels).
