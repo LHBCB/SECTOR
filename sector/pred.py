@@ -91,9 +91,7 @@ def post_hoc_refine_and_score(dataset, model, pred_raw, args):
             "used_K": int(used_K),
             "NMI": float(nmi),
             "HOM": float(hom),
-            "COM": float(com),
-            "ARI": float(ari),
-            "AMI": float(ami),
+            "COM": float(com)
         }
         dataset.adata.uns.setdefault("SECTOR", {})
         dataset.adata.uns["SECTOR"]["final_metrics"] = metrics_dict

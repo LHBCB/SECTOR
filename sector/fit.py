@@ -273,7 +273,6 @@ def run_training_loop(args, model, optimizer, dataset,
                 f"Epoch: {epoch} [{time.time()-t0:.3f}s], "
                 f"Loss: {loss:.6f}, "
                 f"NMI: {stats['nmi']:.6f}, HOM: {stats['hom']:.6f}, COM: {stats['com']:.6f}, "
-                f"ARI: {stats['ari']:.6f}, AMI: {stats['ami']:.6f}, "
                 f"K: {stats['used_K']}/{stats['expected_K']}, "
             )
         else:
