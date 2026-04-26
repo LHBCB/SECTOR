@@ -1,5 +1,16 @@
 import argparse
 
+def _str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        value = v.strip().lower()
+        if value in {"true", "t", "1", "yes", "y"}:
+            return True
+        if value in {"false", "f", "0", "no", "n"}:
+            return False
+    raise argparse.ArgumentTypeError("Boolean value expected (True/False).")
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Run.")
 
@@ -18,10 +29,35 @@ def parse_args(argv=None):
                        help='Number of PCs')
     parser.add_argument('--n_top_genes', type=int, default=2000,
                        help='Number of HVGs.')
+    parser.add_argument('--use_svg', type=_str2bool, nargs='?', const=True, default=False,
+                       help='Use SVGs instead of HVGs for feature selection (True/False).')
     parser.add_argument('--k_s', type=int, default=6,
                         help='Number of neighbours used to create spatial graph.')
     parser.add_argument('--k', type=int, default=1,
                         help='Number of neighbours used to create feature graph.')
+
+    parser.add_argument('--large_scale_mode', type=str, default='auto',
+                        help="Switching rule for large datasets: {'auto', 'off', 'on'}. In auto mode: n_obs < 10000 -> dense mode; 10000 <= n_obs < large_scale_n_obs_threshold -> sparse mode with attr_graph_source='mlp'; n_obs >= large_scale_n_obs_threshold -> sparse mode with attr_graph_source='raw'. Manual 'off' / 'on' preserve the dense / sparse override behavior.")
+    parser.add_argument('--large_scale_n_obs_threshold', type=int, default=100000,
+                        help='Upper cutoff used by auto mode: above this, sparse mode keeps effective attr_graph_source=\'raw\'; between 10000 and this threshold, sparse mode keeps effective attr_graph_source=\'mlp\'.')
+    parser.add_argument('--use_hvg_only', type=int, default=1,
+                        help='Only used in large-scale mode: 1 keeps HVGs only, 0 keeps all genes.')
+    parser.add_argument('--scale_before_pca', type=int, default=0,
+                        help='Only used in large-scale mode: whether to scale before PCA.')
+    parser.add_argument('--pca_zero_center', type=int, default=0,
+                        help='Only used in large-scale mode: whether PCA should zero-center dense matrices.')
+    parser.add_argument('--attr_graph_mode', type=str, default='cached_exact',
+                        help='Only used in large-scale mode: feature graph builder {cached_exact, dense_exact, off}.')
+    parser.add_argument('--attr_graph_source', type=str, default='mlp',
+                        help="Feature graph source {mlp, raw}. In dense mode, mlp reproduces the original mlp behavior and raw switches the dense feature graph to use raw PCA features. In auto sparse mode, the effective source is forced by dataset size (<threshold: mlp, >=threshold: raw). Manual large_scale_mode='on' keeps this user setting.")
+    parser.add_argument('--attr_knn_algorithm', type=str, default='auto',
+                        help='Only used in large-scale mode: sklearn NearestNeighbors algorithm {auto, kd_tree, ball_tree, brute}.')
+    parser.add_argument('--attr_leaf_size', type=int, default=40,
+                        help='Only used in large-scale mode: leaf size for sklearn NearestNeighbors.')
+    parser.add_argument('--attr_n_jobs', type=int, default=-1,
+                        help='Only used in large-scale mode: CPU workers for cached feature graph build.')
+    parser.add_argument('--attr_dense_exact_max_nodes', type=int, default=50000,
+                        help='Only used in large-scale mode: safety cap if attr_graph_mode=dense_exact.')
 
     # ================================
     # Model fitting
@@ -63,6 +99,9 @@ def parse_args(argv=None):
     parser.add_argument('--verbose', type=int, default=20,
                         help='For probe running, evaluate every verbose epochs.')
 
+    parser.add_argument('--detect_anomaly', type=int, default=0,
+                        help='Only used in large-scale mode: whether to keep autograd anomaly detection on.')
+
     # ================================
     # Early stopping (label-free)
     # ================================
@@ -70,7 +109,8 @@ def parse_args(argv=None):
         help="How many consecutive 'verbose checks' with no improvement in SE_spatial/EAS_soft to tolerate before stopping (also requires stability hits).")
     parser.add_argument("--rel_improve_tol", type=float, default=0.005,
         help="Relative improvement tolerance for SE_spatial (lower is better) and EAS_soft (higher is better).")
-    parser.add_argument("--stability_nmi_thr", type=float, default=0.97, help="NMI threshold between consecutive hard assignments to count as 'stable'.")
+    parser.add_argument("--stability_nmi_thr", type=float, default=None,
+        help="NMI threshold between consecutive hard assignments to count as 'stable'. If omitted, it is set automatically by cell count: <10000 -> 0.97, 10000-100000 -> 0.999, >100000 -> 1.0.")
     parser.add_argument("--stability_usedk_window", type=int, default=4,
         help="Window size (in verbose checks) over which the number of used clusters (UsedK) must remain constant.")
     parser.add_argument("--stability_hits_required", type=int, default=3,
@@ -99,6 +139,8 @@ def parse_args(argv=None):
     # ================================
     parser.add_argument('--plot', type=bool, default=False,
         help='Plot and save spatial clusters and pseudotime or not.')
+    parser.add_argument('--invert_y', type=bool, default=True,
+        help='Invert y axis or not, based on spatial coordinate conventions.')
     parser.add_argument('--save', type=bool, default=True,
         help='Save trained sector model or not.')
     parser.add_argument('--save_adata', type=bool, default=True,

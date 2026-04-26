@@ -1,19 +1,33 @@
 import torch
 import torch.nn.functional as F
+from torch_geometric.utils import scatter
+from torch_geometric.data import Data
+
 import numpy as np
 import random
-from scipy.sparse.csgraph import connected_components
 import os
 import matplotlib.pyplot as plt
-
-from torch_geometric.utils import scatter
-
+from matplotlib import colors as mcolors
 import re
 import scanpy as sc
-from .build_graph import build_spatial_graph
-from torch_geometric.data import Data
+
+from sklearn.neighbors import NearestNeighbors
+from scipy.sparse.csgraph import connected_components
 import scipy.sparse
 from scipy.optimize import linear_sum_assignment
+
+from .build_graph import build_spatial_graph
+from .scale_rule import resolve_large_scale_mode
+
+def _as_bool(x):
+    if isinstance(x, bool):
+        return x
+    if isinstance(x, (int, np.integer)):
+        return bool(int(x))
+    if isinstance(x, str):
+        return x.strip().lower() in {'1', 'true', 't', 'yes', 'y'}
+    return bool(x)
+
 
 def set_seed(args):
     random.seed(args.seed)
@@ -24,57 +38,239 @@ def set_seed(args):
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
 
-def adata_preprocess(adata, min_cells=5, min_counts=10, target_sum=1e4, n_comps=20, n_top_genes=2000, random_seed=42):
-    #print(f"Num of HVGs: {n_top_genes}\nNum of PCs: {n_comps}")
+
+# ------------------------------------------------------------------
+# SVG functions
+# ------------------------------------------------------------------
+def _build_svg_knn_graph(coords, k=6):
+    coords = np.asarray(coords, dtype=np.float64)
+    n_obs = coords.shape[0]
+    if n_obs == 0:
+        return scipy.sparse.csr_matrix((0, 0), dtype=np.float64)
+    if n_obs == 1:
+        return scipy.sparse.csr_matrix((1, 1), dtype=np.float64)
+
+    k_eff = min(max(1, int(k)), n_obs - 1)
+    nbrs = NearestNeighbors(n_neighbors=k_eff + 1, metric='euclidean', algorithm='auto')
+    nbrs.fit(coords)
+    _, idx = nbrs.kneighbors(coords, return_distance=True)
+
+    rows = np.repeat(np.arange(n_obs, dtype=np.int64), k_eff)
+    cols = idx[:, 1:].reshape(-1).astype(np.int64)
+    vals = np.ones(rows.shape[0], dtype=np.float64)
+
+    W = scipy.sparse.coo_matrix((vals, (rows, cols)), shape=(n_obs, n_obs), dtype=np.float64).tocsr()
+    W.setdiag(0)
+    W.eliminate_zeros()
+    W = W.maximum(W.T).tocsr().astype(np.float64)
+    return W
+
+
+def _compute_moran_scores(X, W):
+    n_obs = X.shape[0]
+    if n_obs == 0 or X.shape[1] == 0:
+        return np.array([], dtype=np.float64)
+
+    S0 = float(W.sum())
+    if S0 <= 0:
+        return np.full(X.shape[1], -np.inf, dtype=np.float64)
+
+    deg = np.asarray(W.sum(axis=1)).ravel().astype(np.float64)
+
+    if scipy.sparse.issparse(X):
+        X = X.tocsr().astype(np.float64)
+        sums = np.asarray(X.sum(axis=0)).ravel()
+        sq_sums = np.asarray(X.multiply(X).sum(axis=0)).ravel()
+        WX = W.dot(X)
+        xTwx = np.asarray(X.multiply(WX).sum(axis=0)).ravel()
+        dTx = np.asarray(X.T.dot(deg)).ravel()
+    else:
+        X = np.asarray(X, dtype=np.float64)
+        sums = X.sum(axis=0)
+        sq_sums = np.square(X).sum(axis=0)
+        WX = W.dot(X)
+        xTwx = np.multiply(X, WX).sum(axis=0)
+        dTx = deg @ X
+
+    means = sums / float(n_obs)
+    num = xTwx - 2.0 * means * dTx + (means ** 2) * S0
+    den = sq_sums - (sums ** 2) / float(n_obs)
+
+    scores = np.full_like(den, -np.inf, dtype=np.float64)
+    valid = den > 1e-12
+    scores[valid] = (float(n_obs) / S0) * (num[valid] / den[valid])
+    scores[~np.isfinite(scores)] = -np.inf
+    return scores
+
+
+def _select_spatially_variable_genes(adata, n_top_genes=2000, spatial_k=6, flag_key='spatially_variable', score_key='svg_score'):
+    if 'spatial' not in adata.obsm:
+        raise ValueError("adata.obsm['spatial'] not found; cannot compute SVGs.")
+
+    n_genes = int(adata.n_vars)
+    n_select = min(max(1, int(n_top_genes)), n_genes)
+
+    W = _build_svg_knn_graph(adata.obsm['spatial'], k=spatial_k)
+    scores = _compute_moran_scores(adata.X, W)
+
+    order = np.argsort(-scores, kind='mergesort')
+    selected = np.zeros(n_genes, dtype=bool)
+    selected[order[:n_select]] = True
+
+    adata.var[score_key] = scores
+    adata.var[flag_key] = selected
+    adata.var['highly_variable'] = selected
+    return adata
+
+    
+# ------------------------------------------------------------------
+# Small-data preprocessing: EXACT original behavior
+# ------------------------------------------------------------------
+def _adata_preprocess_small_dense(adata, min_cells=5, min_counts=10, 
+                                  target_sum=1e4, n_comps=20, n_top_genes=2000,
+                                  use_svg=False, spatial_k=6,
+                                  random_seed=42):
+    
     adata.layers['counts'] = adata.X.copy()
     sc.pp.filter_genes(adata, min_cells=min_cells)
     sc.pp.normalize_total(adata, target_sum=target_sum)
-    sc.pp.highly_variable_genes(adata, flavor="seurat_v3", layer='counts', n_top_genes=n_top_genes)
+    #sc.pp.log1p(adata)
+
+    if _as_bool(use_svg):
+        adata = _select_spatially_variable_genes(adata, n_top_genes=n_top_genes, spatial_k=spatial_k)
+    else:
+        sc.pp.highly_variable_genes(adata, flavor='seurat_v3', layer='counts', n_top_genes=n_top_genes)
+    
     #adata = adata[:, adata.var['highly_variable']].copy()
     sc.pp.scale(adata)
-    sc.tl.pca(adata, n_comps=n_comps, svd_solver='auto', zero_center=True, random_state=random_seed)
+    sc.pp.pca(adata, n_comps=n_comps, svd_solver='auto', zero_center=True, random_state=random_seed)
+    return adata
+
+# ------------------------------------------------------------------
+# Large-data preprocessing: current patch behavior
+# ------------------------------------------------------------------
+
+def _adata_preprocess_large_sparse(
+    adata, min_cells=5, min_counts=10, target_sum=1e4, n_comps=20,
+    n_top_genes=2000, random_seed=42, use_hvg_only=True,
+    scale_before_pca=False, pca_zero_center=False, use_svg=False, spatial_k=6
+):
+
+    if scipy.sparse.issparse(adata.X):
+        adata.X = adata.X.tocsr().astype(np.float32)
+    else:
+        adata.X = np.asarray(adata.X, dtype=np.float32)
+
+    adata.layers['counts'] = adata.X.copy()
+    sc.pp.filter_genes(adata, min_cells=min_cells)
+    sc.pp.normalize_total(adata, target_sum=target_sum)
+    
+    # 1. CRITICAL: Log1p to stabilize variances.
+    sc.pp.log1p(adata)
+
+    # 2. Skip HVG selection if it's a small targeted panel (like Xenium)
+    if adata.n_vars > n_top_genes:
+        if _as_bool(use_svg):
+            adata = _select_spatially_variable_genes(adata, n_top_genes=n_top_genes, spatial_k=spatial_k)
+        else:
+            sc.pp.highly_variable_genes(
+                adata, flavor='seurat_v3', layer='counts', n_top_genes=n_top_genes,
+            )
+        if use_hvg_only and 'highly_variable' in adata.var:
+            adata = adata[:, adata.var['highly_variable']].copy()
+    elif _as_bool(use_svg):
+        adata = _select_spatially_variable_genes(adata, n_top_genes=adata.n_vars, spatial_k=spatial_k)
+
+    is_sparse = scipy.sparse.issparse(adata.X)
+    
+    # 3. CRITICAL: Densify the matrix if genes are low. 
+    # 500k cells * 500 genes is ~1GB RAM. This allows true zero-centered scaling!
+    if is_sparse and adata.n_vars <= 5000:
+        adata.X = adata.X.toarray()
+        is_sparse = False
+
+    # Matrix is dense, apply standard scaling and centering
+    if scale_before_pca or not is_sparse:
+        sc.pp.scale(adata, max_value=10, zero_center=(False if is_sparse else True))
+        #sc.pp.scale(adata)
+
+    sc.pp.pca(
+        adata,
+        n_comps=min(n_comps, adata.n_vars - 1),
+        svd_solver='arpack' if is_sparse else 'auto',
+        zero_center=True if not is_sparse else bool(pca_zero_center),
+        random_state=random_seed,
+    )
     return adata
 
 def read_st_data(args):
     adata = sc.read_h5ad(f'{args.dataset_path}/{args.dataset}/{args.slice}.h5ad')
 
-    eval_mode = int(getattr(args, "eval_mode", 1)) == 1
+    eval_mode = int(getattr(args, 'eval_mode', 1)) == 1
 
-    # In supervised eval_mode, keep only labeled spots
     if eval_mode:
         if args.label not in adata.obs:
             raise ValueError(f"Label column '{args.label}' not found in adata.obs.")
         adata = adata[~adata.obs[args.label].isna()].copy()
-    # In unsupervised eval_mode, keep all spots (no filtering)
 
-    graph_dict = build_spatial_graph(adata, n=args.k_s, weight_mode=args.weight_mode)
+    large_scale = resolve_large_scale_mode(
+        getattr(args, 'large_scale_mode', 'auto'),
+        adata.n_obs,
+        int(getattr(args, 'large_scale_n_obs_threshold', 100000)),
+    )
+
+    feature_mode = "SVG" if bool(getattr(args, "use_svg", False)) else "HVG"
+    scale_mode = "large/sparse" if large_scale else "small/dense"
+    print(f"[Preprocess] Using {feature_mode} features "
+          f"(n_top_genes={args.n_top_genes}, mode={scale_mode})")
+    
+    graph_dict = build_spatial_graph(
+        adata,
+        n=args.k_s,
+        weight_mode=args.weight_mode,
+        large_scale=large_scale,
+        large_scale_mode=getattr(args, 'large_scale_mode', 'auto'),
+        large_scale_n_obs_threshold=int(getattr(args, 'large_scale_n_obs_threshold', 100000)),
+    )
     edge_index = graph_dict['adj_label'].indices()
     edge_weight = graph_dict['adj_label'].values().float()
 
-    adata = adata_preprocess(
-        adata,
-        n_comps=args.n_comps,
-        n_top_genes=args.n_top_genes,
-        random_seed=args.seed
-    )
-
-    x = torch.from_numpy(adata.obsm['X_pca']).float()
+    if large_scale:
+        adata = _adata_preprocess_large_sparse(
+            adata,
+            n_comps=args.n_comps,
+            n_top_genes=args.n_top_genes,
+            random_seed=args.seed,
+            use_hvg_only=_as_bool(getattr(args, 'use_hvg_only', 1)),
+            use_svg=_as_bool(getattr(args, 'use_svg', False)),
+            spatial_k=args.k_s,
+            scale_before_pca=_as_bool(getattr(args, 'scale_before_pca', 0)),
+            pca_zero_center=_as_bool(getattr(args, 'pca_zero_center', 0)),
+        )
+        x = torch.from_numpy(np.asarray(adata.obsm['X_pca'], dtype=np.float32)).float()
+    else:
+        adata = _adata_preprocess_small_dense(
+            adata,
+            n_comps=args.n_comps,
+            n_top_genes=args.n_top_genes,
+            random_seed=args.seed,
+            use_svg=_as_bool(getattr(args, 'use_svg', False)),
+            spatial_k=args.k_s,
+        )
+        x = torch.from_numpy(adata.obsm['X_pca']).float()
 
     if eval_mode:
-        # Build integer labels only when evaluating with ground truth
         labels = adata.obs[args.label].values
-        # Handle pandas Categorical or plain arrays
-        categories = getattr(labels, "categories", np.unique(labels))
+        categories = getattr(labels, 'categories', np.unique(labels))
         label_to_index = {label: idx for idx, label in enumerate(categories)}
         index_list = [label_to_index[lbl] for lbl in labels]
         y = torch.tensor(index_list, dtype=torch.long)
-
         data = Data(x=x, edge_index=edge_index, edge_weight=edge_weight, y=y)
     else:
-        # Strictly unsupervised: do NOT attach y
         data = Data(x=x, edge_index=edge_index, edge_weight=edge_weight)
 
     return data, adata
+
 
 def g_from_torchsparse(adj):
     adj = adj.coalesce()
@@ -83,6 +279,7 @@ def g_from_torchsparse(adj):
     num_nodes = adj.size(0)
     data = Data(edge_index=edge_index, edge_weight=edge_weight, num_nodes=num_nodes)
     return data.to(edge_weight.device)
+
 
 def index2adjacency(N, edge_index, weight=None, is_sparse=True):
     if is_sparse:
@@ -97,6 +294,7 @@ def index2adjacency(N, edge_index, weight=None, is_sparse=True):
             adjacency[edge_index[0], edge_index[1]] = weight.reshape(-1)
     return adjacency
 
+
 def adjacency2index(adjacency, weight=False):
     adj = adjacency
     edge_index = torch.nonzero(adj).t().contiguous()
@@ -105,6 +303,7 @@ def adjacency2index(adjacency, weight=False):
         return edge_index, weight
     else:
         return edge_index
+
 
 def select_activation(activation):
     if activation == 'elu':
@@ -117,6 +316,7 @@ def select_activation(activation):
         return None
     else:
         raise NotImplementedError('the non_linear_function is not implemented')
+
 
 def decoding_from_assignment(assignmatrix):
     pred = assignmatrix.argmax(dim=1)
@@ -331,8 +531,6 @@ def orient_pseudotime_by_pred_cluster(
     np.ndarray (N,)
         Oriented (and optionally scaled) pseudotime with the chosen cluster low.
     """
-    import numpy as np
-    import torch
 
     # to numpy 1D
     def _to_np1(x):
@@ -380,256 +578,404 @@ def orient_pseudotime_by_spatial_anchor(t_node, coords, anchor="north", k=200, s
     t = sign * t
     return _minmax01(t) if scale else t
 
-def align_pred_colors_spatial(
+
+# ------------------------------------------------------------------
+# Plotting functions
+# ------------------------------------------------------------------
+def plot_pseudotime_spatial(
     adata,
-    label="Region",
-    pred_key="pred_region",
-    axis="auto"   # "y" for top→bottom, "x" for left→right, or "pc1" to auto-pick main axis from GT
+    obs_key="pseudotime",
+    cmap="viridis",
+    s=None,
+    alpha=1.0,
+    invert_y=True,
+    title=None,
+    save_path=None,
+    dpi=100,
+    ax=None,
+    cbar_labelsize=12,
+    cbar_ticksize=10,
+    cbar_title=None,
 ):
-    # --- sanity ---
+    """
+    Scatter-plot pseudotime on tissue coordinates.
+
+    Matched styling with the revised cluster plotting:
+    - adaptive point size when s=None
+    - equal aspect ratio
+    - optional y-axis inversion for Visium-like coordinates
+    - axis turned off
+    - safe save_path directory creation
+    """
+
     if "spatial" not in adata.obsm:
         raise ValueError("adata.obsm['spatial'] not found.")
-    XY = adata.obsm["spatial"]
-    gt = adata.obs[label].astype("category")
-    pr = adata.obs[pred_key].astype("category")
-    adata.obs[label] = gt
-    adata.obs[pred_key] = pr
-    gt_cats  = list(gt.cat.categories)
-    pr_cats  = list(pr.cat.categories)
-    Kg, Kp   = len(gt_cats), len(pr_cats)
+    if obs_key not in adata.obs:
+        raise ValueError(f"adata.obs['{obs_key}'] not found.")
 
-    # --- get GT colors as a dict(cat -> color) ---
-    gt_colors = adata.uns.get(f"{label}_colors")
-    if gt_colors is None or len(gt_colors) != Kg:
-        # fall back to a default palette if GT didn’t have one yet
-        import scanpy as sc
-        pal = sc.pl.palettes.default_20
-        gt_colors = [pal[i % len(pal)] for i in range(Kg)]
-        adata.uns[f"{label}_colors"] = gt_colors
-    color_by_gt = dict(zip(gt_cats, gt_colors))
+    coords = np.asarray(adata.obsm["spatial"])
+    t = np.asarray(adata.obs[obs_key].values, dtype=float)
 
-    # --- centroids for each category ---
-    def centroids(cats, key):
-        C = []
-        vals = adata.obs[key].values
-        for c in cats:
-            m = vals == c
-            C.append(np.nanmean(XY[m], axis=0))
-        return np.vstack(C)
+    if coords.ndim != 2 or coords.shape[1] < 2:
+        raise ValueError("adata.obsm['spatial'] must be an array of shape (N, 2) or (N, >=2).")
 
-    Cg = centroids(gt_cats, label)   # (Kg, 2)
-    Cp = centroids(pr_cats, pred_key) # (Kp, 2)
+    # Drop rows with invalid coordinates or pseudotime values
+    valid = (
+        np.isfinite(coords[:, 0]) &
+        np.isfinite(coords[:, 1]) &
+        np.isfinite(t)
+    )
+    coords_plot = coords[valid, :2]
+    t_plot = t[valid]
 
-    # --- choose a 1D ordering axis ---
-    if axis == "y":      # vertical ordering (top→bottom)
-        a = np.array([0.0, 1.0])
-    elif axis == "x":    # horizontal ordering (left→right)
-        a = np.array([1.0, 0.0])
-    else:                # "auto": main axis from GT centroids
-        X = Cg - np.nanmean(Cg, axis=0, keepdims=True)
-        # simple SVD for the first principal direction
-        _, _, Vt = np.linalg.svd(np.nan_to_num(X), full_matrices=False)
-        a = Vt[0]
+    n_obs = coords_plot.shape[0]
 
-    # --- project centroids and get ranks along that axis ---
-    sg = (Cg @ a)  # GT scores
-    sp = (Cp @ a)  # Pred scores
+    # Matched adaptive sizing with the revised cluster plotting
+    if s is None:
+        s = float(np.clip(40000.0 / max(1, n_obs), 0.5, 10.0))
 
-    rg = np.argsort(np.argsort(sg))  # ranks 0..Kg-1
-    rp = np.argsort(np.argsort(sp))  # ranks 0..Kp-1
+    created_fig = False
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(5, 5), dpi=dpi)
+        created_fig = True
+    else:
+        fig = ax.figure
 
-    # --- assign predicted clusters to GT colors by matching ranks (Hungarian on |rank diff|) ---
-    cost = np.abs(rp[:, None] - rg[None, :])  # (Kp, Kg)
-    row_ind, col_ind = linear_sum_assignment(cost)
+    sc_handle = ax.scatter(
+        coords_plot[:, 0],
+        coords_plot[:, 1],
+        c=t_plot,
+        s=s,
+        alpha=alpha,
+        cmap=cmap,
+        edgecolors="none",
+        rasterized=(n_obs > 50000),
+    )
 
-    # build color list for predicted categories (in *pred category order*)
-    pred_colors = ["#808080"] * Kp
-    for pi, gi in zip(row_ind, col_ind):
-        pred_colors[pi] = color_by_gt[gt_cats[gi]]
+    if invert_y:
+        ax.invert_yaxis()
 
-    # if there are more pred clusters than GT, fill remaining by sampling GT palette in order
-    if any(c == "#808080" for c in pred_colors):
-        order_gt_by_axis = list(np.argsort(sg))
-        palette_sorted   = [gt_colors[i] for i in order_gt_by_axis]
-        idx = np.clip(np.round(np.linspace(0, len(palette_sorted)-1, Kp)).astype(int), 0, len(palette_sorted)-1)
-        for i, c in enumerate(pred_colors):
-            if c == "#808080":
-                pred_colors[i] = palette_sorted[idx[i]]
+    ax.set_aspect("equal")
+    ax.set_axis_off()
+    ax.set_title("" if title is None else title)
 
-    # reorder predicted categories themselves to appear in spatial order in legends/plots
-    pred_order = [pr_cats[i] for i in np.argsort(sp)]
-    adata.obs[pred_key] = adata.obs[pred_key].cat.reorder_categories(pred_order)
+    cbar = fig.colorbar(sc_handle, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label(obs_key if cbar_title is None else cbar_title, fontsize=cbar_labelsize)
+    cbar.ax.tick_params(labelsize=cbar_ticksize)
 
-    # write colors into .uns in the same order as adata.obs[pred_key].cat.categories
-    adata.uns[f"{pred_key}_colors"] = [pred_colors[pr_cats.index(c)] for c in pred_order]
+    if save_path:
+        save_dir = os.path.dirname(save_path)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+        fig.savefig(save_path, bbox_inches="tight", dpi=dpi)
+        
+    return ax
 
-    return {
-        "pred_order": pred_order,
-        "pairing": list(zip([pr_cats[i] for i in row_ind], [gt_cats[j] for j in col_ind]))
-    }
+
+def _choose_spatial_axis(XY, axis="auto"):
+    if axis in ("x", "y"):
+        return axis
+    span_x = np.nanpercentile(XY[:, 0], 95) - np.nanpercentile(XY[:, 0], 5)
+    span_y = np.nanpercentile(XY[:, 1], 95) - np.nanpercentile(XY[:, 1], 5)
+    return "y" if span_y >= span_x else "x"
+
+
+def _auto_cluster_point_size(n_obs: int) -> float:
+    #return float(np.clip(60000.0 / max(1, int(n_obs)), 1.0, 20.0))
+    if n_obs < 10000:
+        s = 50
+    elif n_obs < 50000:
+        s = 5
+    elif n_obs < 150000:
+        s = 1
+    else:
+        s = 0.5
+    return s
+
+def _scanpy_default_palette(n_categories: int):
+    """
+    Use Scanpy-style default categorical palettes.
+    Falls back gracefully if a palette is unavailable.
+    """
+    if n_categories <= 20 and hasattr(sc.pl.palettes, "default_20"):
+        return list(sc.pl.palettes.default_20[:n_categories])
+    if n_categories <= 28 and hasattr(sc.pl.palettes, "default_28"):
+        return list(sc.pl.palettes.default_28[:n_categories])
+    if n_categories <= 102 and hasattr(sc.pl.palettes, "default_102"):
+        return list(sc.pl.palettes.default_102[:n_categories])
+
+    if hasattr(sc.pl.palettes, "default_102"):
+        base = list(sc.pl.palettes.default_102)
+    else:
+        base = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+
+    reps = int(np.ceil(n_categories / len(base)))
+    return (base * reps)[:n_categories]
+
+
+def _set_default_palette(adata, key):
+    """
+    Ensure a categorical palette exists for this key and return (categories, colors).
+    If adata.uns already contains a matching '{key}_colors' entry, keep it.
+    Otherwise, assign a default Scanpy-like palette.
+    """
+    adata.obs[key] = adata.obs[key].astype("category")
+    cats = list(adata.obs[key].cat.categories)
+    color_key = f"{key}_colors"
+    colors = list(adata.uns.get(color_key, []))
+    if len(colors) != len(cats):
+        colors = _scanpy_default_palette(len(cats))
+        adata.uns[color_key] = colors
+    return cats, colors
+
+
+def _category_centroids(adata, key):
+    if "spatial" not in adata.obsm:
+        raise ValueError("adata.obsm['spatial'] not found.")
+
+    adata.obs[key] = adata.obs[key].astype("category")
+    cats = list(adata.obs[key].cat.categories)
+    XY = np.asarray(adata.obsm["spatial"])
+    vals = np.asarray(adata.obs[key].astype(object).values)
+
+    centroids = []
+    for c in cats:
+        mask = (vals == c)
+        centroids.append(np.nanmean(XY[mask], axis=0))
+    return cats, np.vstack(centroids)
 
 
 def relabel_pred_to_spatial_order(adata, pred_key="pred_region", axis="y"):
     """
-    Rename predicted categories to 0..K-1 according to spatial order along `axis`
-    ('y' = top→bottom, 'x' = left→right), while preserving colors.
+    Fallback for unlabeled mode:
+    - order predicted clusters by spatial centroid
+    - rename them to 0..K-1
+    - preserve existing colors if available; otherwise assign a default palette
     """
     if "spatial" not in adata.obsm:
         raise ValueError("adata.obsm['spatial'] not found.")
-    XY = adata.obsm["spatial"]
 
-    pr = adata.obs[pred_key].astype("category")
-    cats_old = list(pr.cat.categories)
-    colors_old = adata.uns.get(f"{pred_key}_colors")
-    if colors_old is None or len(colors_old) != len(cats_old):
-        raise ValueError(f"{pred_key}_colors missing or length mismatch.")
+    XY = np.asarray(adata.obsm["spatial"])
+    axis = _choose_spatial_axis(XY, axis)
+
+    adata.obs[pred_key] = adata.obs[pred_key].astype("category")
+    cats_old = list(adata.obs[pred_key].cat.categories)
+
+    colors_old = list(adata.uns.get(f"{pred_key}_colors", []))
+    if len(colors_old) != len(cats_old):
+        colors_old = _scanpy_default_palette(len(cats_old))
     color_by_old = dict(zip(cats_old, colors_old))
 
-    # centroids per predicted category
-    cent = []
-    for c in cats_old:
-        m = (adata.obs[pred_key].values == c)
-        cent.append(np.nanmean(XY[m], axis=0))
-    C = np.vstack(cent)
-
-    # pick axis
+    _, C = _category_centroids(adata, pred_key)
     a = np.array([0.0, 1.0]) if axis == "y" else np.array([1.0, 0.0])
     scores = C @ a
-    order_spatial = np.argsort(scores)         # indices of cats_old in spatial order
+    order_spatial = np.argsort(scores)
+    ordered_old = [cats_old[i] for i in order_spatial]
 
-    # rename: old_cat -> new integer 0..K-1 following spatial order
-    mapping = {cats_old[i]: i for i in order_spatial}
-    adata.obs[pred_key] = pr.cat.rename_categories(mapping)
+    mapping = {old: i for i, old in enumerate(ordered_old)}
+    adata.obs[pred_key] = adata.obs[pred_key].cat.rename_categories(mapping)
+    adata.obs[pred_key] = adata.obs[pred_key].cat.reorder_categories(
+        list(range(len(ordered_old))), ordered=True
+    )
 
-    # ensure legend order is 0..K-1
-    K = len(cats_old)
-    new_order = list(range(K))
-    adata.obs[pred_key] = adata.obs[pred_key].cat.reorder_categories(new_order, ordered=True)
+    adata.uns[f"{pred_key}_colors"] = [color_by_old[old] for old in ordered_old]
 
-    # rebuild palette in 0..K-1 order using the old colors of the spatially ordered cats
-    adata.uns[f"{pred_key}_colors"] = [color_by_old[cats_old[i]] for i in order_spatial]
+    return {
+        "pred_order_old": ordered_old,
+        "pred_order_new": list(range(len(ordered_old))),
+    }
 
-def plot_pseudotime_spatial(adata, obs_key="pseudotime", cmap="viridis",
-                            s=3, alpha=1.0, invert_y=True, title=None,
-                            save_path=None, dpi=200, ax=None, cbar_labelsize=6, cbar_ticksize=6):
+
+def align_pred_colors_spatial(adata, label="Region", pred_key="pred_region", axis="auto"):
     """
-    Scatter-plot pseudotime on tissue coordinates.
-    - obs_key: column in adata.obs with pseudotime in [0,1]
-    - s: point size; if None, chosen adaptively based on N
-    - invert_y: Visium-like coordinates have origin at top-left; invert to match tissue
+    Labeled mode:
+    - force GT annotation colors to the default Scanpy-like palette
+    - match predicted clusters to GT colors by maximum overlap
+    - order predicted clusters by matched GT order
+    - rename predicted clusters to 0..K-1 in that matched order
     """
-    import matplotlib.pyplot as plt
-
-    if "spatial" not in adata.obsm_keys():
+    if "spatial" not in adata.obsm:
         raise ValueError("adata.obsm['spatial'] not found.")
-    coords = np.asarray(adata.obsm["spatial"])
-    t = np.asarray(adata.obs[obs_key].values, dtype=float)
-    N = coords.shape[0]
-    s = s if s is not None else max(1.0, 20000.0 / max(1, N))
+    if label not in adata.obs:
+        raise ValueError(f"adata.obs['{label}'] not found.")
 
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(2.5, 2.5), dpi=dpi)
+    XY = np.asarray(adata.obsm["spatial"])
+    axis = _choose_spatial_axis(XY, axis)
 
-    sc = ax.scatter(coords[:, 0], coords[:, 1], c=t, s=s, alpha=alpha, cmap=cmap, edgecolors='none')
-    if invert_y:
-        ax.invert_yaxis()
-    ax.set_aspect('equal')
-    #ax.set_xticks([]); ax.set_yticks([])
-    ax.set_title(title)
-    ax.set_axis_off() 
-    cbar = plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
-    
-    cbar.set_label(obs_key, fontsize=cbar_labelsize)
-    cbar.ax.tick_params(labelsize=cbar_ticksize)
-    
-    if save_path:
-        os.makedirs("figures", exist_ok=True)
-        plt.savefig(save_path, bbox_inches="tight", dpi=dpi)
-    return ax
+    # Ground truth: force default palette
+    adata.obs[label] = adata.obs[label].astype("category")
+    gt_cats, gt_colors = _set_default_palette(adata, label)
+    Kg = len(gt_cats)
+
+    # Predictions
+    adata.obs[pred_key] = adata.obs[pred_key].astype("category")
+    pr_cats = list(adata.obs[pred_key].cat.categories)
+    Kp = len(pr_cats)
+
+    if Kg == 0 or Kp == 0:
+        return {"pairing": [], "pred_order_old": [], "pred_order_new": []}
+
+    # Overlap matrix: rows = pred, cols = GT
+    pr_codes = adata.obs[pred_key].cat.codes.to_numpy()
+    gt_codes = adata.obs[label].cat.codes.to_numpy()
+    valid = (pr_codes >= 0) & (gt_codes >= 0)
+
+    overlap = np.zeros((Kp, Kg), dtype=np.float64)
+    np.add.at(overlap, (pr_codes[valid], gt_codes[valid]), 1.0)
+
+    row_ind, col_ind = linear_sum_assignment(-overlap)
+
+    # Map old predicted categories -> GT color
+    color_by_old_pred = {}
+    matched_pairs = []
+    used_pred = set()
+    used_gt = set()
+
+    for pi, gi in zip(row_ind, col_ind):
+        if overlap[pi, gi] > 0:
+            color_by_old_pred[pr_cats[pi]] = gt_colors[gi]
+            matched_pairs.append((pr_cats[pi], gt_cats[gi], int(overlap[pi, gi]), gi))
+            used_pred.add(pr_cats[pi])
+            used_gt.add(gi)
+
+    # Order matched predicted categories by GT category order
+    matched_pairs = sorted(matched_pairs, key=lambda x: x[3])
+    ordered_old = [p for p, g, n, gi in matched_pairs]
+
+    # Unmatched predicted categories: append by spatial order
+    remaining = [c for c in pr_cats if c not in used_pred]
+    if remaining:
+        _, Cpred = _category_centroids(adata, pred_key)
+        old_to_idx = {c: i for i, c in enumerate(pr_cats)}
+        a = np.array([0.0, 1.0]) if axis == "y" else np.array([1.0, 0.0])
+        scores = Cpred @ a
+        remaining = sorted(remaining, key=lambda c: scores[old_to_idx[c]])
+
+        unused_gt_colors = [gt_colors[i] for i in range(Kg) if i not in used_gt]
+        fill_palette = unused_gt_colors if len(unused_gt_colors) > 0 else gt_colors
+
+        for j, c in enumerate(remaining):
+            color_by_old_pred[c] = fill_palette[j % len(fill_palette)]
+
+        ordered_old.extend(remaining)
+
+    # Rename predicted domains to 0..K-1 in the matched order
+    mapping = {old: i for i, old in enumerate(ordered_old)}
+    adata.obs[pred_key] = adata.obs[pred_key].cat.rename_categories(mapping)
+    adata.obs[pred_key] = adata.obs[pred_key].cat.reorder_categories(
+        list(range(len(ordered_old))), ordered=True
+    )
+
+    # Palette in the new category order 0..K-1
+    adata.uns[f"{pred_key}_colors"] = [color_by_old_pred[old] for old in ordered_old]
+
+    return {
+        "pairing": [(p, g, n) for p, g, n, _ in matched_pairs],
+        "pred_order_old": ordered_old,
+        "pred_order_new": list(range(len(ordered_old))),
+    }
+
 
 def plot_cluster_spatial(
     adata,
     save_path=None,
-    s=50,
+    s=None,
     legend_fontsize=10,
-    label='Region',
-    pred_key='pred_region',
+    label="Region",
+    pred_key="pred_region",
     eval_mode=1,
     legend_title_gt="Annotation",
     legend_title_pred="Domains",
     legend_titlesize=None,
     legend_loc="right margin",
+    alpha=1.0,
+    dpi=100,
+    invert_y=True,
 ):
+    """
+    Plot annotation and predicted domains with:
+    - default Scanpy-like palette (only assigned when a palette is absent)
+    - matched GT/pred colors when labels are available
+    - predicted domains relabeled to 0..K-1
+    - optional y-axis inversion controlled by `invert_y`
+    """
+    if "spatial" not in adata.obsm:
+        raise ValueError("adata.obsm['spatial'] not found.")
 
-    align_pred_colors_spatial(adata, label=label, pred_key=pred_key, axis="auto")
-    relabel_pred_to_spatial_order(adata, pred_key=pred_key, axis="y")
+    XY = np.asarray(adata.obsm["spatial"])
 
-    # Ensure categorical dtypes
-    adata.obs[label] = adata.obs[label].astype("category")
-    adata.obs["pred_region"] = adata.obs[pred_key].astype("category")
+    if eval_mode == 1 and label in adata.obs and not adata.obs[label].isna().all():
+        align_pred_colors_spatial(adata, label=label, pred_key=pred_key, axis="auto")
+        adata.obs[label] = adata.obs[label].astype("category")
+    else:
+        relabel_pred_to_spatial_order(adata, pred_key=pred_key, axis="auto")
 
-    # Pull out spatial coordinates
-    adata.obs['x_coord'] = adata.obsm['spatial'][:, 0]
-    adata.obs['y_coord'] = adata.obsm['spatial'][:, 1]
+    adata.obs[pred_key] = adata.obs[pred_key].astype("category")
+    adata.obs["x_coord"] = XY[:, 0]
+    adata.obs["y_coord"] = XY[:, 1]
+
+    if s is None:
+        s = _auto_cluster_point_size(adata.n_obs)
 
     def _format_ax(ax):
         ax.set_aspect("equal")
-        ax.invert_yaxis()        # matches Visium orientation
-        ax.set_axis_off() 
-        ax.set_title(None)  
+        if invert_y:
+            ax.invert_yaxis()
+        ax.set_axis_off()
+        ax.set_title(None)
 
     def _set_legend_title(ax, title):
-        # Try to get the legend Scanpy created; if missing, build one from handles.
         leg = ax.get_legend()
         if leg is None:
             leg = getattr(ax, "legend_", None)
         if leg is None:
-            handles, labels = ax.get_legend_handles_labels()
+            handles, legend_labels = ax.get_legend_handles_labels()
             if handles:
-                leg = ax.legend(handles, labels, title=title,
-                                fontsize=legend_fontsize, frameon=False, loc="upper right")
+                leg = ax.legend(
+                    handles,
+                    legend_labels,
+                    title=title,
+                    fontsize=legend_fontsize,
+                    frameon=False,
+                    loc="upper right",
+                )
         if leg is not None:
             leg.set_title(title)
-            # Title font size; default to legend_fontsize if not provided
             ts = legend_titlesize if legend_titlesize is not None else legend_fontsize
             leg.get_title().set_fontsize(ts)
 
-    if eval_mode == 1:
-        # Two-panel figure: ground-truth + prediction
+    if eval_mode == 1 and label in adata.obs:
         fig, axes = plt.subplots(1, 2, figsize=(10, 5))
 
         sc.pl.scatter(
             adata, x="x_coord", y="y_coord", color=label,
-            size=s, frameon=False,
+            size=s, alpha=alpha, frameon=False,
             ax=axes[0], show=False,
             legend_fontsize=legend_fontsize,
-            legend_loc=legend_loc
+            legend_loc=legend_loc,
         )
         sc.pl.scatter(
-            adata, x="x_coord", y="y_coord", color="pred_region",
-            size=s, frameon=False,
+            adata, x="x_coord", y="y_coord", color=pred_key,
+            size=s, alpha=alpha, frameon=False,
             ax=axes[1], show=False,
             legend_fontsize=legend_fontsize,
-            legend_loc=legend_loc
+            legend_loc=legend_loc,
         )
 
         _format_ax(axes[0])
         _format_ax(axes[1])
-
-        # Set legend titles
         _set_legend_title(axes[0], legend_title_gt)
         _set_legend_title(axes[1], legend_title_pred)
 
     else:
-        # Single-panel figure: prediction only
         fig, ax = plt.subplots(1, 1, figsize=(5, 5))
 
         sc.pl.scatter(
-            adata, x="x_coord", y="y_coord", color="pred_region",
-            size=s, frameon=False,
+            adata, x="x_coord", y="y_coord", color=pred_key,
+            size=s, alpha=alpha, frameon=False,
             ax=ax, show=False,
             legend_fontsize=legend_fontsize,
-            legend_loc=legend_loc
+            legend_loc=legend_loc,
         )
 
         _format_ax(ax)
@@ -637,7 +983,9 @@ def plot_cluster_spatial(
 
     plt.tight_layout(pad=3.0)
     if save_path:
-        os.makedirs("figures", exist_ok=True)
-        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+        save_dir = os.path.dirname(save_path)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+        fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
     plt.show()
     plt.close(fig)
