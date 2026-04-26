@@ -18,15 +18,19 @@ class SECTOR:
 
     # Keys that imply data/model/device must be rebuilt if changed
     DATASET_KEYS: set[str] = {
-        "dataset_path", "dataset", "slice", "label", "weight_mode", "n_comps", "n_top_genes"
+        "dataset_path", "dataset", "slice", "label", "weight_mode", "n_comps", "n_top_genes",
+        "k_s", "eval_mode", "large_scale_mode", "large_scale_n_obs_threshold",
+        "use_hvg_only", "scale_before_pca", "pca_zero_center", "use_svg"
     }
     DEVICE_KEYS: set[str] = {"gpu"}
     MODEL_KEYS: set[str] = {
-        "embed_dim", "num_clusters", "dropout", "activation", "k", "beta_f", "seed"
+        "embed_dim", "num_clusters", "dropout", "activation", "k", "beta_f", "seed",
+        "attr_graph_mode", "attr_graph_source", "attr_knn_algorithm", "attr_leaf_size",
+        "attr_n_jobs", "attr_dense_exact_max_nodes", "detect_anomaly"
     }
     # Prediction-only knobs that never require rebuild
     PRED_ONLY_KEYS: set[str] = {
-        "island_min_abs", "island_min_frac", "island_max_iter", "root_cluster", "spatial_anchor"
+        "island_min_abs", "island_min_frac", "island_max_iter", "root_cluster", "spatial_anchor", "invert_y"
     }
     # Optimizer-only “hot” override
     OPT_ONLY_KEYS: set[str] = {"lr"}
@@ -131,7 +135,7 @@ class SECTOR:
         )
 
         # Early-stopping config + training loop (identical)
-        early_cfg = fit_mod.cfg_from_args(args_fit)
+        early_cfg = fit_mod.cfg_from_args(args_fit, self.dataset.num_nodes)
         best_state = fit_mod.run_training_loop(
             args=args_fit,
             model=self.model,

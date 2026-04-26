@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import scipy.sparse as sp
 from typing import Optional, Tuple
 from sklearn.neighbors import NearestNeighbors
 
@@ -9,23 +10,26 @@ from torch_geometric.nn import GATConv, MessagePassing
 from torch_geometric.utils import scatter
 
 from .utility.utils import select_activation, g_from_torchsparse
+from .utility.scale_rule import resolve_scale_profile
+
 
 # ------------------------- Graph utilities -------------------------
+def _scipy_to_torch_sparse_tensor(sparse_mx: sp.spmatrix, device=None) -> torch.Tensor:
+    coo = sparse_mx.tocoo().astype(np.float32)
+    indices = torch.from_numpy(np.vstack([coo.row, coo.col]).astype(np.int64))
+    values = torch.from_numpy(coo.data.astype(np.float32))
+    return torch.sparse_coo_tensor(indices, values, size=coo.shape, device=device).coalesce()
+
 
 @torch.no_grad()
-def KNN_weighted(x: torch.Tensor,
-                 k: int,
-                 metric: str = "cosine",
-                 sigma: float = None,
-                 chunk_size: int = 2048) -> torch.Tensor:
+def KNN_weighted_dense(x: torch.Tensor,
+                       k: int,
+                       metric: str = "cosine",
+                       sigma: float = None,
+                       chunk_size: int = 2048) -> torch.Tensor:
     """
-    GPU KNN using torch.cdist + topk
-
-    - metric="cosine": neighbors by cosine distance; weights = cosine similarity
-                       (clipped to [0,1]); implemented via cdist on L2-normalized vectors.
-    - else (Euclidean): neighbors by L2 distance; weights = exp(-d^2/(2*sigma^2)) if sigma
-                        is given, otherwise 1.0
-    - Returns a symmetrized sparse adjacency: 0.5 * (A + A^T).
+    Dense exact feature-graph builder using torch.cdist + topk.
+    Preserved for small datasets.
     """
     assert x.dim() == 2, "x must be [N, D]"
     N, _ = x.shape
@@ -39,29 +43,22 @@ def KNN_weighted(x: torch.Tensor,
         ).coalesce()
 
     k = min(k, max(1, N - 1))
-
-    # Database tensor
     xb = F.normalize(x, p=2, dim=1, eps=1e-12) if metric == "cosine" else x
 
     rows_all, cols_all, vals_all = [], [], []
 
     for start in range(0, N, chunk_size):
         end = min(start + chunk_size, N)
-        q = xb[start:end]                 # [B, D]
+        q = xb[start:end]
         B = q.shape[0]
 
-        # Distances
-        dist = torch.cdist(q, xb, p=2)    # [B, N]
-        # Exclude self within this block
+        dist = torch.cdist(q, xb, p=2)
         row_idx = torch.arange(start, end, device=device)
         dist[torch.arange(B, device=device), row_idx] = float("inf")
 
-        # Top-k nearest (smallest distance)
         dvals, idx = torch.topk(dist, k, dim=1, largest=False, sorted=False)
 
-        # Weights
         if metric == "cosine":
-            # For unit vectors: cos_sim = 1 - (||u-v||^2)/2 = 1 - (d^2)/2
             w = (1.0 - 0.5 * (dvals ** 2)).clamp_(min=0.0, max=1.0)
         else:
             if sigma is not None:
@@ -88,7 +85,6 @@ def KNN_weighted(x: torch.Tensor,
         device=device
     ).coalesce()
 
-    # Symmetrize by averaging
     A = (A + A.transpose(0, 1)).coalesce()
     if A._nnz() > 0:
         A = torch.sparse_coo_tensor(
@@ -96,6 +92,89 @@ def KNN_weighted(x: torch.Tensor,
         ).coalesce()
 
     return A
+
+
+@torch.no_grad()
+def KNN_weighted_cached_exact(x: torch.Tensor,
+                              k: int,
+                              metric: str = "cosine",
+                              sigma: float = None,
+                              algorithm: str = "auto",
+                              leaf_size: int = 40,
+                              n_jobs: int = -1,
+                              out_device=None) -> torch.Tensor:
+    """
+    Large-data feature-graph builder from the sparse patch. Builds an exact kNN graph
+    once on CPU via sklearn.NearestNeighbors and returns a sparse torch tensor.
+    """
+    assert x.dim() == 2, "x must be [N, D]"
+    N, D = x.shape
+    device = x.device if out_device is None else out_device
+    if N == 0 or k <= 0:
+        return torch.sparse_coo_tensor(
+            torch.empty(2, 0, dtype=torch.long, device=device),
+            torch.empty(0, dtype=x.dtype, device=device),
+            (N, N),
+            device=device
+        ).coalesce()
+
+    k = min(k, max(1, N - 1))
+    x_np = x.detach().float().cpu().numpy()
+
+    if metric == "cosine":
+        norms = np.linalg.norm(x_np, axis=1, keepdims=True)
+        x_np = x_np / np.clip(norms, 1e-12, None)
+        nn_metric = "euclidean"
+    else:
+        nn_metric = "euclidean"
+
+    if algorithm == "auto":
+        if D <= 32:
+            algorithm_use = "kd_tree"
+        elif D <= 64:
+            algorithm_use = "ball_tree"
+        else:
+            algorithm_use = "auto"
+    else:
+        algorithm_use = algorithm
+
+    nbrs = NearestNeighbors(
+        n_neighbors=min(k + 1, N),
+        metric=nn_metric,
+        algorithm=algorithm_use,
+        leaf_size=leaf_size,
+        n_jobs=n_jobs,
+    )
+    nbrs.fit(x_np)
+    dvals, idx = nbrs.kneighbors(x_np, return_distance=True)
+
+    dvals = dvals[:, 1:]
+    idx = idx[:, 1:]
+
+    rows = np.repeat(np.arange(N, dtype=np.int64), idx.shape[1])
+    cols = idx.reshape(-1).astype(np.int64)
+    dvals = dvals.reshape(-1).astype(np.float32)
+
+    if metric == "cosine":
+        vals = np.clip(1.0 - 0.5 * (dvals ** 2), 0.0, 1.0).astype(np.float32)
+    else:
+        if sigma is not None:
+            vals = np.exp(-(dvals ** 2) / (2.0 * (sigma ** 2))).astype(np.float32)
+        else:
+            vals = np.ones_like(dvals, dtype=np.float32)
+
+    A = sp.coo_matrix((vals, (rows, cols)), shape=(N, N), dtype=np.float32).tocsr()
+    A.setdiag(0)
+    A.eliminate_zeros()
+    A = (A + A.T).tocsr().astype(np.float32)
+    if A.nnz > 0:
+        A.data *= 0.5
+    return _scipy_to_torch_sparse_tensor(A, device=device)
+
+
+# backwards-compatible name for any external imports
+KNN_weighted = KNN_weighted_dense
+
 
 def rescale_total_mass(A_sparse: torch.Tensor, target_sum: torch.Tensor):
     A = A_sparse.coalesce()
@@ -354,7 +433,36 @@ class SEModel(nn.Module):
         
         self.attr_metric = 'cosine' # fixed 'cosine', can also be 'euclidean'
         self.attr_sigma  = 5.0 # fixed 5.0
-        
+
+        # auto-switch: small datasets keep the dense mode; large datasets use the sparse mode
+        self.large_scale_mode = getattr(args, 'large_scale_mode', 'auto')
+        self.large_scale_n_obs_threshold = int(getattr(args, 'large_scale_n_obs_threshold', 100000))
+        self.scale_profile = resolve_scale_profile(
+            self.large_scale_mode,
+            self.num_nodes,
+            self.large_scale_n_obs_threshold,
+        )
+        self.large_scale = (self.scale_profile != 'dense_mode')
+
+        # large-data feature-graph options (ignored in small exact mode)
+        self.attr_graph_mode = getattr(args, 'attr_graph_mode', 'cached_exact')
+        self.attr_graph_source = getattr(args, 'attr_graph_source', 'mlp')
+        # Minimal auto-policy override:
+        #   - mid-size sparse runs use mlp
+        #   - very large sparse runs use raw
+        # Manual large_scale_mode='on' / 'off' preserves the user's attr_graph_source.
+        if self.scale_profile == 'sparse_mlp':
+            self._effective_attr_graph_source = 'mlp'
+        elif self.scale_profile == 'sparse_raw':
+            self._effective_attr_graph_source = 'raw'
+        else:
+            self._effective_attr_graph_source = self.attr_graph_source
+        self.attr_knn_algorithm = getattr(args, 'attr_knn_algorithm', 'auto')
+        self.attr_leaf_size = int(getattr(args, 'attr_leaf_size', 40))
+        self.attr_n_jobs = int(getattr(args, 'attr_n_jobs', -1))
+        self.attr_dense_exact_max_nodes = int(getattr(args, 'attr_dense_exact_max_nodes', 50000))
+        self._cached_attr_graph = None
+
         self.pseudotime_spectral: Optional[torch.Tensor] = None
 
     def hard(self, s_dic):
@@ -364,6 +472,73 @@ class SEModel(nn.Module):
         H = torch.zeros_like(S)
         H[torch.arange(S.shape[0], device=S.device), idx] = 1
         self.hard_dic = {1: H}
+
+    def _get_attr_graph_input(self, feature: torch.Tensor, cache_safe: bool = False) -> torch.Tensor:
+        """
+        Select the feature representation used to build the attribute graph.
+
+        - mlp: original behavior in small-scale mode; MLP(feature) in training mode
+               so dropout etc. behave exactly as before.
+        - raw: use the PCA features directly.
+
+        When cache_safe=True (used by the large-scale cached path), the MLP is
+        evaluated deterministically under eval() so the cached graph is stable.
+        """
+        src = str(self._effective_attr_graph_source).strip().lower()
+        if src == 'mlp':
+            if cache_safe:
+                was_training = self.mlp.training
+                self.mlp.eval()
+                z = self.mlp(feature.to(self.device))
+                if was_training:
+                    self.mlp.train()
+                return z
+            return self.mlp(feature.to(self.device))
+        elif src == 'raw':
+            return feature.to(self.device)
+        else:
+            raise ValueError(f"Unknown attr_graph_source: {self.attr_graph_source}")
+
+    @torch.no_grad()
+    def _get_large_attr_graph(self, feature: torch.Tensor):
+        if self.beta_f <= 0.0 or self.k <= 0:
+            return None
+
+        if self.attr_graph_mode == 'off':
+            return None
+
+        if self._cached_attr_graph is not None:
+            return self._cached_attr_graph
+
+        z = self._get_attr_graph_input(feature, cache_safe=True)
+
+        if self.attr_graph_mode == 'cached_exact':
+            A = KNN_weighted_cached_exact(
+                z,
+                self.k,
+                metric=self.attr_metric,
+                sigma=self.attr_sigma,
+                algorithm=self.attr_knn_algorithm,
+                leaf_size=self.attr_leaf_size,
+                n_jobs=self.attr_n_jobs,
+                out_device=self.device,
+            )
+        elif self.attr_graph_mode == 'dense_exact':
+            if z.size(0) > self.attr_dense_exact_max_nodes:
+                raise RuntimeError(
+                    f"Dense_exact feature graph disabled above attr_dense_exact_max_nodes={self.attr_dense_exact_max_nodes}; got N={z.size(0)}"
+                )
+            A = KNN_weighted_dense(
+                z,
+                self.k,
+                metric=self.attr_metric,
+                sigma=self.attr_sigma,
+            ).to(self.device)
+        else:
+            raise ValueError(f"Unknown attr_graph_mode: {self.attr_graph_mode}")
+
+        self._cached_attr_graph = A.coalesce()
+        return self._cached_attr_graph
     
     def forward(self, adj_s_sparse, feature, degree=None):
         feature = feature.to(self.device)
@@ -374,11 +549,24 @@ class SEModel(nn.Module):
         self._tv_ew = adj_s_sparse.values()
         self._A_for_traj = adj_s_sparse
 
-        # attribute graph
-        E_expr = self.mlp(feature)
-        adj_f_raw = KNN_weighted(E_expr, self.k, metric=self.attr_metric, sigma=self.attr_sigma).to(self.device)
-
-        fused = (adj_s_sparse + self.beta_f * adj_f_raw).coalesce()
+        if self.large_scale:
+            adj_f_raw = self._get_large_attr_graph(feature)
+            if adj_f_raw is None:
+                fused = adj_s_sparse
+            else:
+                fused = (adj_s_sparse + self.beta_f * adj_f_raw).coalesce()
+        else:
+            # Small-data dense_exact path. With the default attr_graph_source='mlp'
+            # this is exactly the original behavior; setting attr_graph_source='raw'
+            # keeps the dense builder but swaps the feature source to raw PCA features.
+            z_attr = self._get_attr_graph_input(feature, cache_safe=False)
+            adj_f_raw = KNN_weighted_dense(
+                z_attr,
+                self.k,
+                metric=self.attr_metric,
+                sigma=self.attr_sigma,
+            ).to(self.device)
+            fused = (adj_s_sparse + self.beta_f * adj_f_raw).coalesce()
 
         # embedding on fused graph
         g = g_from_torchsparse(fused)
@@ -388,11 +576,8 @@ class SEModel(nn.Module):
         tree_node_embed_dic = {self.height: e.to(self.device)}
         g_dic = {self.height: g}
 
-        # assignment at the finest level
         adj_s_level = adj_s_sparse
         for i, layer in enumerate(self.assignlayers):
-            # For the current implementation (height=2) there is a single assignment
-            # layer that maps node embeddings directly to soft cluster assignments.
             h, e_coarse, s = layer(e, g.edge_index, g.edge_weight, adj_s_level)
             tree_node_embed_dic[self.height - i - 1] = e_coarse.to(self.device)
             s_dic[self.height - i] = s.to(self.device)

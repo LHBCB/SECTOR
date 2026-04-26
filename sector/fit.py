@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import normalized_mutual_info_score as nmi_score
 
+from .utility.scale_rule import resolve_large_scale_mode
 from .utility.metrics import cluster_metrics
 from .utility.parser import parse_args
 from .utility.dataset import STData
@@ -27,7 +28,7 @@ from .utility.utils import (
 from .model import SEModel
 
 torch.autograd.set_detect_anomaly(True)
-#print(torch.cuda.is_available())
+
 
 # ---------------------------------------------------------------------
 # Early-stopping configuration
@@ -41,15 +42,56 @@ class EarlyStoppingConfig:
     stability_hits_required: int = 3    # consecutive stable hits required
 
 
-def cfg_from_args(args) -> EarlyStoppingConfig:
-    """Build early-stopping config, allowing overrides via args."""
+def _auto_stability_nmi_thr_from_n_obs(n_obs: int) -> float:
+    """Default stability threshold by dataset size.
+
+    - n_obs < 10000          -> 0.97
+    - 10000 <= n_obs <= 1e5  -> 0.999
+    - n_obs > 1e5            -> 1.0 (fixed-horizon / no early stopping)
+    """
+    n_obs = int(n_obs)
+    if n_obs < 10000:
+        return 0.97
+    if n_obs <= 100000:
+        return 0.999
+    return 1.0
+
+
+def resolve_stability_nmi_thr(args, n_obs: int | None = None) -> float:
+    """Resolve stability_nmi_thr, honoring an explicit user value if provided."""
+    raw = getattr(args, 'stability_nmi_thr', None)
+    if raw is not None:
+        return float(raw)
+    if n_obs is None:
+        return 0.97
+    return _auto_stability_nmi_thr_from_n_obs(n_obs)
+
+
+def cfg_from_args(args, n_obs: int | None = None) -> EarlyStoppingConfig:
+    """Build early-stopping config, with automatic stability_nmi_thr by dataset size."""
     return EarlyStoppingConfig(
         unsup_patience_checks=getattr(args, 'unsup_patience_checks', 6),
         rel_improve_tol=getattr(args, 'rel_improve_tol', 0.005),
-        stability_nmi_thr=getattr(args, 'stability_nmi_thr', 0.99),
+        stability_nmi_thr=resolve_stability_nmi_thr(args, n_obs),
         stability_usedk_window=getattr(args, 'stability_usedk_window', 4),
         stability_hits_required=getattr(args, 'stability_hits_required', 3),
     )
+
+
+
+def _use_last_epoch_mode(stability_nmi_thr_or_args, n_obs: int | None = None) -> bool:
+    """
+    Treat stability_nmi_thr >= 1.0 as an explicit fixed-horizon / final-epoch mode.
+
+    Accepts either:
+      - a resolved numeric threshold, or
+      - args (+ optional n_obs) for backward compatibility.
+    """
+    if isinstance(stability_nmi_thr_or_args, (int, float, np.floating)):
+        thr = float(stability_nmi_thr_or_args)
+    else:
+        thr = resolve_stability_nmi_thr(stability_nmi_thr_or_args, n_obs)
+    return float(thr) >= 1.0
 
 
 # ---------------------------------------------------------------------
@@ -87,7 +129,16 @@ def setup_device_and_data(args):
     dataset.adj = dataset.adj.to(device)
     dataset.feature = dataset.feature.to(device)
     dataset.print_statistic()
-    #print(dataset.adj._nnz(), dataset.weight.min().item(), dataset.weight.max().item())
+
+    large_scale = resolve_large_scale_mode(
+        getattr(args, 'large_scale_mode', 'auto'),
+        dataset.num_nodes,
+        int(getattr(args, 'large_scale_n_obs_threshold', 100000)),
+    )
+    if large_scale:
+        torch.autograd.set_detect_anomaly(bool(getattr(args, 'detect_anomaly', 0)))
+    else:
+        torch.autograd.set_detect_anomaly(True)
 
     model_path = f'./sector_model/{args.dataset}_{args.slice}_K{args.num_clusters}.pt'
     return device, dataset, model_path
@@ -236,6 +287,7 @@ def compute_unsup_diagnostics(model, dataset, hard_pred):
 # ---------------------------------------------------------------------
 # Training loop + early stopping
 # ---------------------------------------------------------------------
+
 def run_training_loop(args, model, optimizer, dataset,
                       lambda_tv_target, start_epoch, end_epoch,
                       restart_epoch, model_path, device,
@@ -243,6 +295,12 @@ def run_training_loop(args, model, optimizer, dataset,
     """
     Full training loop with label-free diagnostics, stability checks,
     early stopping, and optional model checkpointing.
+
+    Special case:
+      if stability_nmi_thr >= 1.0, treat the run as fixed-horizon/final-epoch mode:
+        - no early stopping
+        - no intermediate "best-SE" checkpoint saves
+        - downstream prediction/checkpointing uses the final epoch
     """
     best = BestState()
 
@@ -251,6 +309,14 @@ def run_training_loop(args, model, optimizer, dataset,
     unsup_noimpr_cnt = 0
     last_pred_for_stability = None
     eval_mode = int(getattr(args, "eval_mode", 1)) == 1
+    use_last_epoch_mode = _use_last_epoch_mode(early_cfg.stability_nmi_thr)
+
+    # Track final-epoch state in case we intentionally want to use it downstream
+    last_epoch = None
+    last_pred_tensor = None
+    last_se_spatial = None
+    last_eas_soft = None
+    last_stats = None
 
     for epoch in range(restart_epoch, args.epochs):
         t0 = time.time()
@@ -275,17 +341,25 @@ def run_training_loop(args, model, optimizer, dataset,
                 f"NMI: {stats['nmi']:.6f}, HOM: {stats['hom']:.6f}, COM: {stats['com']:.6f}, "
                 f"K: {stats['used_K']}/{stats['expected_K']}, "
             )
+            last_stats = dict(stats)
         else:
             # Minimal logging when labels are not used
             print(
                 f"Epoch: {epoch} [{time.time()-t0:.3f}s], "
                 f"Loss: {loss:.6f}"
             )
+            last_stats = None
+
+        # Keep a final-epoch snapshot in memory
+        last_epoch = epoch
+        last_pred_tensor = pred_tensor.detach().clone()
 
         # 3) label-free diagnostics for early stopping
         se_spat, eas_soft, eas_hard, used_K = compute_unsup_diagnostics(
             model=model, dataset=dataset, hard_pred=pred_tensor
         )
+        last_se_spatial = se_spat
+        last_eas_soft = eas_soft
 
         # UsedK stability window
         usedk_hist.append(used_K)
@@ -302,13 +376,14 @@ def run_training_loop(args, model, optimizer, dataset,
         if se_spat < (best.best_se_spatial * (1.0 - early_cfg.rel_improve_tol)):
             best.best_se_spatial = se_spat
             best.best_unsup_epoch = epoch
-            best.best_pred_raw = pred_tensor
-            if eval_mode and '_' in locals():
+            best.best_pred_raw = pred_tensor.detach().clone()
+            if eval_mode and (last_stats is not None):
                 # keep best NMI only for informative logging
-                best.best_nmi = stats['nmi']
+                best.best_nmi = last_stats['nmi']
             unsup_noimpr_cnt = 0
             improved = True
-            if args.save:
+            # In final-epoch mode, skip intermediate checkpoint writes.
+            if args.save and (not use_last_epoch_mode):
                 os.makedirs("sector_model", exist_ok=True)
                 torch.save(model.state_dict(), model_path)
 
@@ -327,8 +402,7 @@ def run_training_loop(args, model, optimizer, dataset,
             stability_hits = 0
 
         # 6) early stop?
-        if (unsup_noimpr_cnt >= early_cfg.unsup_patience_checks) and \
-           (stability_hits >= early_cfg.stability_hits_required):
+        if (not use_last_epoch_mode) and            (unsup_noimpr_cnt >= early_cfg.unsup_patience_checks) and            (stability_hits >= early_cfg.stability_hits_required):
             msg = (
                 f"[Early stopping] epoch {epoch}: no SE_spatial/EAS_soft improvement for "
                 f"{early_cfg.unsup_patience_checks} checks and assignments stable "
@@ -340,5 +414,29 @@ def run_training_loop(args, model, optimizer, dataset,
                 msg += f" NMI at best unsup epoch: {best.best_nmi:.6f}."
             print(msg)
             break
+
+    # If the user intentionally set stability_nmi_thr >= 1.0,
+    # treat this as a final-epoch evaluation mode.
+    if use_last_epoch_mode:
+        if last_epoch is None:
+            raise RuntimeError("run_training_loop ended before any training epoch was executed.")
+
+        best.best_unsup_epoch = last_epoch
+        best.best_pred_raw = last_pred_tensor
+        if last_se_spatial is not None:
+            best.best_se_spatial = float(last_se_spatial)
+        if last_eas_soft is not None:
+            best.best_eas_soft = float(last_eas_soft)
+        if eval_mode and (last_stats is not None):
+            best.best_nmi = float(last_stats["nmi"])
+
+        if args.save:
+            os.makedirs("sector_model", exist_ok=True)
+            torch.save(model.state_dict(), model_path)
+
+        print(
+            f"[Final-epoch mode] stability_nmi_thr>=1.0, "
+            f"using epoch {last_epoch} for downstream prediction/checkpointing."
+        )
 
     return best

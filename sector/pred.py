@@ -66,10 +66,11 @@ def post_hoc_refine_and_score(dataset, model, pred_raw, args):
         max_iter=max_iter,
     )
     changed = (pred_before != pred_clean).sum()
-    print(
-        f"[Post hoc] Island cleaner changed {changed} spots "
-        f"(min_abs={min_abs}, min_frac={min_frac}, max_iter={max_iter})"
-    )
+    if changed != 0:
+        print(
+            f"[Post hoc] Island cleaner changed {changed} spots "
+            f"(min_abs={min_abs}, min_frac={min_frac}, max_iter={max_iter})"
+        )
 
     dataset.adata.obs["pred_region"] = pred_clean
 
@@ -79,9 +80,8 @@ def post_hoc_refine_and_score(dataset, model, pred_raw, args):
         cm = cluster_metrics(dataset.labels, torch.as_tensor(pred_clean))
         expected_K, used_K, nmi, hom, com, ari, ami, _ = cm.evaluateFromLabel()
         print(
-            f"[Post hoc] After island removal => "
+            f"[Final metrics] "
             f"NMI={nmi:.6f}, HOM={hom:.6f}, COM={com:.6f}, "
-            f"ARI={ari:.6f}, AMI={ami:.6f} "
             f"(K={used_K}/{expected_K})"
         )
 
@@ -91,7 +91,9 @@ def post_hoc_refine_and_score(dataset, model, pred_raw, args):
             "used_K": int(used_K),
             "NMI": float(nmi),
             "HOM": float(hom),
-            "COM": float(com)
+            "COM": float(com),
+            "ARI": float(ari),
+            "AMI": float(ami),
         }
         dataset.adata.uns.setdefault("SECTOR", {})
         dataset.adata.uns["SECTOR"]["final_metrics"] = metrics_dict
@@ -100,21 +102,6 @@ def post_hoc_refine_and_score(dataset, model, pred_raw, args):
 
     # If not evaluating, don't compute/return label metrics
     return None, None
-
-
-# ---------------------------------------------------------------------
-# Run summary save (optional text log; off by default)
-# ---------------------------------------------------------------------
-def save_run_summary(args, nmi, ari, save_path):
-    """Append run hyperparams and best metrics to the result file."""
-    os.makedirs("output", exist_ok=True)
-    with open(save_path, 'a') as f:
-        f.write(
-            f"lr={args.lr}, embed_dim={args.embed_dim}, k={args.k}, dropout={args.dropout}, "
-            f"beta_f={args.beta_f}, epochs={args.epochs}, num_clusters={args.num_clusters}, "
-            f"verbose={args.verbose}, activation={args.activation}, seed={args.seed} \n"
-        )
-        f.write(f"--------Best NMI: [{nmi}], Best ARI: [{ari}] \n")
 
 
 # ---------------------------------------------------------------------
@@ -156,7 +143,8 @@ def export_trajectory_and_embeddings(args, model, dataset, s_dic, emb_dic, datas
             dataset.adata, 
             label=args.label,
             save_path=f"figures/{dataset_name}.{slice_name}.clusters.png",
-            eval_mode=args.eval_mode
+            eval_mode=args.eval_mode,
+            invert_y=getattr(args, "invert_y", True),
         )
         
         # Save a figure
@@ -164,7 +152,8 @@ def export_trajectory_and_embeddings(args, model, dataset, s_dic, emb_dic, datas
             dataset.adata,
             obs_key="pseudotime",
             save_path=f"figures/{dataset_name}.{slice_name}.pseudotime.png",
-            title=""
+            title="",
+            invert_y=getattr(args, "invert_y", True),
         )
 
     # Save S/embeddings/A_c for downstream analysis
