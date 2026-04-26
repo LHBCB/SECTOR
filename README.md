@@ -61,7 +61,30 @@ This installs, among others:
 
 ## 3. Tutorial
 
-### 3.1 Expected input format
+### 3.1 Detailed tutorials
+
+Three group-level tutorial notebooks are provided in this repository:
+
+| Tutorial | Datasets covered | Main content |
+|---|---|---|
+| [`tutorial_sequencing_based_ST.ipynb`](tutorial_sequencing_based_ST.ipynb) | 10x Visium DLPFC; Stereo-seq mouse embryo | Sequencing-based ST workflow and parameter settings. |
+| [`tutorial_imaging_based_ST.ipynb`](tutorial_imaging_based_ST.ipynb) | MERFISH hypothalamus; STARmap cortex; BaristaSeq primary cortex | Imaging-based ST workflow and parameter settings. |
+| [`tutorial_large_scale_high_resolution_ST.ipynb`](tutorial_large_scale_high_resolution_ST.ipynb) | Visium HD CRC; Xenium IDC | Large-scale high-resolution ST workflow and parameter settings. |
+
+Each notebook demonstrates:
+
+- expected `.h5ad` input format;
+- model initialisation through the Python API;
+- key parameter settings for the corresponding dataset group;
+- model fitting with `fit()`;
+- domain and pseudotime inference with `pred()`;
+- visualisation of spatial domains and pseudotime;
+- metric reporting when annotations are available;
+- practical tuning and troubleshooting guidance.
+
+It is recommended to start from the tutorial notebook that best matches the technology and scale of the target dataset.
+
+### 3.2 Expected input format
 
 SECTOR expects each spatial section to be stored as an `.h5ad` / AnnData object. By default, both the Python API and CLI look for files at:
 
@@ -69,24 +92,24 @@ SECTOR expects each spatial section to be stored as an `.h5ad` / AnnData object.
 {dataset_path}/{dataset}/{slice}.h5ad
 ```
 
-For example:
+This path structure is convenient when a project contains multiple datasets or multiple slices per dataset. For example:
 
 ```bash
-./data/DLPFC/151673.h5ad
+./data/10x_visium/151673.h5ad
 ```
 
 For a custom dataset, create the same structure, for example:
 
 ```bash
-./data/MyDataset/MySlice.h5ad
+./data/my_dataset/my_slice.h5ad
 ```
 
 and set:
 
 ```python
 dataset_path = "./data"
-dataset = "MyDataset"
-slice = "MySlice"
+dataset = "my_dataset"
+slice = "my_slice"
 ```
 
 The input `.h5ad` file should contain:
@@ -99,7 +122,7 @@ The input `.h5ad` file should contain:
 
 If no annotation is available, run SECTOR with `eval_mode=0`. When `eval_mode=1`, SECTOR computes clustering metrics such as NMI, homogeneity and completeness using the label column specified by `label`. Labels are not used during model training.
 
-### 3.2 Basic usage example: 10x Visium DLPFC
+### 3.3 Basic usage example: 10x Visium DLPFC
 
 ```python
 from sector import SECTOR
@@ -138,7 +161,7 @@ adata = m.pred(
 )
 ```
 
-### 3.3 Outputs
+### 3.4 Outputs
 
 By default, SECTOR saves outputs to:
 
@@ -157,29 +180,6 @@ The output `.h5ad` file stores:
 | Inferred pseudotime | `adata.obs["pseudotime"]` |
 | SECTOR embedding | `adata.obsm["sector_embedding"]` |
 | Metrics, if `eval_mode=1` | `adata.uns["SECTOR"]["final_metrics"]` |
-
-### 3.4 Detailed tutorials
-
-Three group-level tutorial notebooks are provided in this repository:
-
-| Tutorial | Datasets covered | Main content |
-|---|---|---|
-| [`tutorial_sequencing_based_ST.ipynb`](tutorial_sequencing_based_ST.ipynb) | 10x Visium DLPFC; Stereo-seq mouse embryo | Sequencing-based ST workflow and parameter settings. |
-| [`tutorial_imaging_based_ST.ipynb`](tutorial_imaging_based_ST.ipynb) | MERFISH hypothalamus; STARmap cortex; BaristaSeq primary cortex | Imaging-based ST workflow and parameter settings. |
-| [`tutorial_large_scale_high_resolution_ST.ipynb`](tutorial_large_scale_high_resolution_ST.ipynb) | Visium HD CRC; Xenium IDC | Large-scale high-resolution ST workflow and parameter settings. |
-
-Each notebook demonstrates:
-
-- expected `.h5ad` input format;
-- model initialisation through the Python API;
-- key parameter settings for the corresponding dataset group;
-- model fitting with `fit()`;
-- domain and pseudotime inference with `pred()`;
-- visualisation of spatial domains and pseudotime;
-- metric reporting when annotations are available;
-- practical tuning and troubleshooting guidance.
-
-It is recommended to start from the tutorial notebook that best matches the technology and scale of the target dataset.
 
 ### 3.5 Optional: running SECTOR from the command-line interface
 
