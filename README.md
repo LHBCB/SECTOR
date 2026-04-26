@@ -120,7 +120,7 @@ The input `.h5ad` file should contain:
 | `adata.obsm["spatial"]` | Spatial coordinates with shape `n_obs × 2`. |
 | `adata.obs[label]` | Optional annotation column for evaluation only. The default label key is `Region`. |
 
-If no annotation is available, run SECTOR with `eval_mode=0`. When `eval_mode=1`, SECTOR computes clustering metrics such as NMI, homogeneity and completeness using the label column specified by `label`. Labels are not used during model training.
+If no annotation is available, run SECTOR with `eval_mode=0`. When `eval_mode=1`, SECTOR computes clustering metrics such as normalised mutual information (NMI), homogeneity (HOM) and completeness (COM) using the label column specified by `label`. Labels are not used during model training.
 
 ### 3.3 Basic usage example: 10x Visium DLPFC
 
