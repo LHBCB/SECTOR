@@ -10,6 +10,7 @@ from anndata import AnnData
 
 from scipy import sparse
 from scipy.stats import spearmanr
+import scanpy as sc
 
 from typing import Dict, Optional, Tuple
 from scipy.spatial.distance import pdist
@@ -629,7 +630,6 @@ def get_top_genes(
 
         if has_hvg_col and has_any_hvg:
             adata_use = adata_use[:, hvg_mask].copy()
-            print(f"Using existing HVGs in adata.var['highly_variable']: {adata_use.n_vars} genes")
         else:
             hvg_kwargs = dict(
                 flavor=hvg_flavor,
