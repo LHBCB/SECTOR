@@ -4,7 +4,7 @@
     <img width="100%" src="SECTOR_workflow.jpg" alt="SECTOR model">
 </p>
 
-SECTOR (**S**tructural **E**ntropy-based **C**lustering and pseudo**T**ime **OR**dering) is a lightweight deep graph learning framework for spatial transcriptomics (ST). SECTOR jointly infers spatial domains and a continuous within-section pseudotime from the same model. It builds a fused spatial–expression graph from spot/cell/bin coordinates and gene expression, then optimises a differentiable structural entropy objective regularised by spatial total variation (TV) to obtain spatially coherent domains and smooth pseudotime fields.
+SECTOR (**S**tructural **E**ntropy-based **C**lustering and pseudo**T**ime **OR**dering) is a lightweight deep graph learning framework for spatial transcriptomics (ST). SECTOR jointly infers spatial domains and a continuous within-section pseudotime from the same model. It builds a fused spatial–expression graph from coordinates and gene expression of spatial locations (spots/cells/bins), then optimises a differentiable structural entropy objective regularised by spatial total variation (TV) to obtain spatially coherent domains and smooth pseudotime fields.
 
 SECTOR has been evaluated across seven ST datasets grouped into three data regimes:
 
